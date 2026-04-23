@@ -35,6 +35,15 @@ type AppConfig struct {
 	Transport httpclient.TransportConfig `json:"transport,omitempty"`
 }
 
+// Save writes the config back to a JSON file.
+func (c *AppConfig) Save(path string) error {
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0644)
+}
+
 // Load reads and parses a JSON config file.
 func Load(path string) (*AppConfig, error) {
 	b, err := os.ReadFile(path)

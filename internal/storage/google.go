@@ -394,3 +394,44 @@ func (b *GoogleBackend) Delete(ctx context.Context, filename string) error {
 
 	return nil
 }
+
+func (b *GoogleBackend) CreateFolder(ctx context.Context, name string) (string, error) {
+	tok, err := b.getValidToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	meta := map[string]interface{}{
+		"name":     name,
+		"mimeType": "application/vnd.google-apps.folder",
+	}
+	body, _ := json.Marshal(meta)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://www.googleapis.com/drive/v3/files", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		resBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("create folder returned %d: %s", resp.StatusCode, string(resBody))
+	}
+
+	var resData struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+		return "", err
+	}
+
+	b.folderID = resData.ID
+	return resData.ID, nil
+}

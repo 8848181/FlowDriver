@@ -63,6 +63,21 @@ func main() {
 		log.Fatalf("Backend login failed: %v", err)
 	}
 
+	// AUTOMATION: If folder ID is missing, create it and save back to config
+	if appCfg.StorageType == "google" && appCfg.GoogleFolderID == "" {
+		log.Println("Zero-Config: Creating new Google Drive folder 'Flow-Data'...")
+		folderID, err := backend.CreateFolder(ctx, "Flow-Data")
+		if err != nil {
+			log.Fatalf("Failed to auto-create folder: %v", err)
+		}
+		appCfg.GoogleFolderID = folderID
+		if err := appCfg.Save(configPath); err != nil {
+			log.Printf("Warning: Failed to save folder ID to %s: %v", configPath, err)
+		} else {
+			log.Printf("Zero-Config: Saved folder ID %s to %s", folderID, configPath)
+		}
+	}
+
 	cid := appCfg.ClientID
 	if cid == "" {
 		cid = generateSessionID()[:8] // Short random ID as fallback

@@ -93,3 +93,11 @@ func (b *LocalBackend) Delete(ctx context.Context, filename string) error {
 	}
 	return nil
 }
+
+func (b *LocalBackend) CreateFolder(ctx context.Context, name string) (string, error) {
+	path := filepath.Join(b.baseDir, name)
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return "", err
+	}
+	return name, nil
+}

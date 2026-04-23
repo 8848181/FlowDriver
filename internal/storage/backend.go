@@ -23,4 +23,7 @@ type Backend interface {
 
 	// Delete removes a file from the backend after it has been read or expired.
 	Delete(ctx context.Context, filename string) error
+
+	// CreateFolder creates a storage container (e.g. Google Drive folder) and returns its ID.
+	CreateFolder(ctx context.Context, name string) (string, error)
 }

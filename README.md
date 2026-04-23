@@ -75,7 +75,7 @@ Create your `config.json` based on the provided examples:
   "transport": {
     "TargetIP": "216.239.38.120:443",
     "SNI": "google.com",
-    "HostHeader": "googleapis.com"
+    "HostHeader": "www.googleapis.com"
   }
 }
 ```

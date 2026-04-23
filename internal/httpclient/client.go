@@ -20,7 +20,7 @@ type TransportConfig struct {
 	SNI string
 
 	// HostHeader is the Host header to inject in HTTP requests.
-	// E.g., "googleapis.com"
+	// E.g., "www.googleapis.com"
 	HostHeader string
 
 	// InsecureSkipVerify allows bypassing certificate validation if necessary.

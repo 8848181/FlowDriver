@@ -34,13 +34,22 @@ func (b *LocalBackend) Login(ctx context.Context) error {
 	return nil
 }
 
-func (b *LocalBackend) Upload(ctx context.Context, filename string, data []byte) error {
+func (b *LocalBackend) Upload(ctx context.Context, filename string, data io.Reader) error {
 	path := filepath.Join(b.baseDir, filename)
 	// Write to a temporary file first, then rename to avoid partial reads by the polling server
 	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write temp file: %w", err)
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
 	}
+	
+	if _, err := io.Copy(f, data); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to write data: %w", err)
+	}
+	f.Close()
+
 	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("failed to rename temp file: %w", err)
@@ -66,7 +75,7 @@ func (b *LocalBackend) ListQuery(ctx context.Context, prefix string) ([]string, 
 	return results, nil
 }
 
-func (b *LocalBackend) Download(ctx context.Context, filename string) ([]byte, error) {
+func (b *LocalBackend) Download(ctx context.Context, filename string) (io.ReadCloser, error) {
 	path := filepath.Join(b.baseDir, filename)
 	file, err := os.Open(path)
 	if err != nil {
@@ -76,13 +85,7 @@ func (b *LocalBackend) Download(ctx context.Context, filename string) ([]byte, e
 		}
 		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
-	defer file.Close()
-
-	data, err := io.ReadAll(file)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
-	}
-	return data, nil
+	return file, nil
 }
 
 func (b *LocalBackend) Delete(ctx context.Context, filename string) error {

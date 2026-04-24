@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"strconv"
 	"strings"
@@ -32,6 +33,13 @@ type Engine struct {
 
 	// Server mode handler: called when a new session is discovered
 	OnNewSession func(sessionID, targetAddr string, s *Session)
+
+	// Concurrency control for storage operations (Upload/Download)
+	sem chan struct{}
+
+	// Track processed files to avoid duplicates
+	processed   map[string]bool
+	processedMu sync.Mutex
 }
 
 func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine {
@@ -40,6 +48,7 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 		id:             clientID,
 		sessions:       make(map[string]*Session),
 		closedSessions: make(map[string]time.Time),
+		processed:      make(map[string]bool),
 		// Default intervals: Poll (RX) fast for responsiveness, Flush (TX) slower for gathering
 		pollTicker:  500 * time.Millisecond,
 		flushTicker: 300 * time.Millisecond,
@@ -51,6 +60,8 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 		e.myDir = DirRes
 		e.peerDir = DirReq
 	}
+	// Limit to 8 concurrent upload/download operations to avoid OOM and FD exhaustion
+	e.sem = make(chan struct{}, 8)
 	return e
 }
 
@@ -92,6 +103,7 @@ func (e *Engine) AddSession(s *Session) {
 	e.sessionMu.Lock()
 	defer e.sessionMu.Unlock()
 	e.sessions[s.ID] = s
+	log.Printf("Engine.AddSession: Added session %s (Total now: %d)", s.ID, len(e.sessions))
 }
 
 func (e *Engine) flushLoop(ctx context.Context) {
@@ -136,6 +148,7 @@ func (e *Engine) flushAll(ctx context.Context) {
 
 		payload := s.txBuf
 		s.txBuf = nil
+		s.txCond.Broadcast() // Release any blocked writers
 
 		env := Envelope{
 			SessionID:  s.ID,
@@ -159,31 +172,38 @@ func (e *Engine) flushAll(ctx context.Context) {
 		s.mu.Unlock()
 	}
 
-	for cid, mux := range muxes {
-		var b []byte
-		for _, env := range mux {
-			eb, err := env.MarshalBinary()
-			if err != nil {
-				log.Printf("binary encode error: %v", err)
-				return
-			}
-			b = append(b, eb...)
-		}
+	if len(muxes) > 0 {
+		// log.Printf("Engine.flushAll: Prepared muxes for %d clients", len(muxes))
+	}
 
+	for cid, mux := range muxes {
 		// Filename format: {dir}-{clientID}-mux-{timestamp}.bin
-		// If clientID is empty (server-side error?), fallback to generic
 		fnameCID := cid
 		if fnameCID == "" {
 			fnameCID = "unknown"
 		}
 		filename := fmt.Sprintf("%s-%s-mux-%d.bin", e.myDir, fnameCID, time.Now().UnixNano())
 
-		// Upload asynchronously
-		go func(fname string, data []byte) {
-			if err := e.backend.Upload(ctx, fname, data); err != nil {
+		// Upload asynchronously with backpressure/limit
+		go func(fname string, m []Envelope) {
+			e.sem <- struct{}{}        // Acquire
+			defer func() { <-e.sem }() // Release
+
+			pr, pw := io.Pipe()
+			go func() {
+				defer pw.Close()
+				for _, env := range m {
+					if err := env.Encode(pw); err != nil {
+						log.Printf("mux encode error: %v", err)
+						break
+					}
+				}
+			}()
+
+			if err := e.backend.Upload(ctx, fname, pr); err != nil {
 				log.Printf("upload error %s: %v", fname, err)
 			}
-		}(filename, b)
+		}(filename, mux)
 	}
 
 	for _, id := range closedSessionIDs {
@@ -196,10 +216,6 @@ func (e *Engine) pollLoop(ctx context.Context) {
 	maxPollInterval := 5 * time.Second
 	timer := time.NewTimer(currentPollInterval)
 	defer timer.Stop()
-
-	// Track processed files
-	processed := make(map[string]bool)
-	var processedMu sync.Mutex
 
 	for {
 		select {
@@ -264,12 +280,24 @@ func (e *Engine) pollLoop(ctx context.Context) {
 			// We found files! Let's download them in parallel to boost speed massively
 			var wg sync.WaitGroup
 			for _, f := range files {
-				processedMu.Lock()
-				already := processed[f]
-				if !already {
-					processed[f] = true
+				// STARTUP OPTIMIZATION: Ignore files older than 5 minutes to avoid memory spikes on restart
+				parts := strings.Split(f, "-")
+				if len(parts) >= 3 {
+					tsStr := parts[len(parts)-1]
+					tsStr = strings.TrimSuffix(tsStr, ".bin")
+					ts, _ := strconv.ParseInt(tsStr, 10, 64)
+					if ts > 0 && time.Since(time.Unix(0, ts)) > 5*time.Minute {
+						e.backend.Delete(ctx, f) // Silent cleanup
+						continue
+					}
 				}
-				processedMu.Unlock()
+
+				e.processedMu.Lock()
+				already := e.processed[f]
+				if !already {
+					e.processed[f] = true
+				}
+				e.processedMu.Unlock()
 
 				if already {
 					continue
@@ -278,27 +306,20 @@ func (e *Engine) pollLoop(ctx context.Context) {
 				wg.Add(1)
 				go func(fname string) {
 					defer wg.Done()
-					b, err := e.backend.Download(ctx, fname)
+
+					e.sem <- struct{}{}        // Acquire
+					defer func() { <-e.sem }() // Release
+
+					// log.Printf("Engine.pollLoop: Downloading %s", fname)
+					rc, err := e.backend.Download(ctx, fname)
 					if err != nil {
 						log.Printf("download error %s: %v", fname, err)
-						processedMu.Lock()
-						delete(processed, fname) // failed to download, retry next poll
-						processedMu.Unlock()
+						e.processedMu.Lock()
+						delete(e.processed, fname) // failed to download, retry next poll
+						e.processedMu.Unlock()
 						return
 					}
-
-					var envs []Envelope
-					curr := b
-					for len(curr) > 0 {
-						var env Envelope
-						n, err := env.UnmarshalBinary(curr)
-						if err != nil {
-							log.Printf("mux unmarshal error %s: %v", fname, err)
-							break
-						}
-						envs = append(envs, env)
-						curr = curr[n:]
-					}
+					defer rc.Close()
 
 					// Extract ClientID from filename for server-side session initialization
 					var fileClientID string
@@ -307,26 +328,32 @@ func (e *Engine) pollLoop(ctx context.Context) {
 						fileClientID = parts[1]
 					}
 
-					// Process the entire MUX batch sequentially inside the go routine
-					for i := range envs {
-						env := &envs[i]
+					// STREAMING DECODE
+					count := 0
+					for {
+						var env Envelope
+						if err := env.Decode(rc); err != nil {
+							if err != io.EOF && err != io.ErrUnexpectedEOF {
+								log.Printf("mux decode error %s: %v", fname, err)
+							}
+							break
+						}
+						count++
 
-						// Check tombstone first
+						// Process envelope immediately
 						e.closedSessionsMu.Lock()
 						if _, exists := e.closedSessions[env.SessionID]; exists {
 							e.closedSessionsMu.Unlock()
-							continue // Ignore packets for recently closed sessions
+							continue
 						}
 						e.closedSessionsMu.Unlock()
 
 						e.sessionMu.Lock()
 						s, exists := e.sessions[env.SessionID]
 						if !exists && e.myDir == DirRes && e.OnNewSession != nil {
-							// Server logic: new connection
 							s = NewSession(env.SessionID)
-							s.ClientID = fileClientID // Associate session with the client that sent the request
+							s.ClientID = fileClientID
 							e.sessions[env.SessionID] = s
-							// Release lock before calling OnNewSession to avoid deadlocks
 							e.sessionMu.Unlock()
 							log.Printf("Engine: Triggering new session %s for Client %s", env.SessionID, fileClientID)
 							e.OnNewSession(env.SessionID, env.TargetAddr, s)
@@ -335,7 +362,7 @@ func (e *Engine) pollLoop(ctx context.Context) {
 						}
 
 						if s != nil {
-							s.ProcessRx(env)
+							s.ProcessRx(&env)
 						}
 					}
 
@@ -382,6 +409,13 @@ func (e *Engine) cleanupLoop(ctx context.Context) {
 				}
 			}
 			e.closedSessionsMu.Unlock()
+
+			// Periodically clear processed map to prevent infinite growth
+			e.processedMu.Lock()
+			if len(e.processed) > 5000 {
+				e.processed = make(map[string]bool)
+			}
+			e.processedMu.Unlock()
 
 			// ZERO-TRAFFIC CLIENT OPTIMIZATION:
 			if e.myDir == DirReq {

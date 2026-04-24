@@ -217,35 +217,39 @@ func (b *GoogleBackend) getValidToken(ctx context.Context) (string, error) {
 	return b.token, nil
 }
 
-func (b *GoogleBackend) Upload(ctx context.Context, filename string, data []byte) error {
+func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Reader) error {
 	tok, err := b.getValidToken(ctx)
 	if err != nil {
 		return err
 	}
 
-	var metaBuf bytes.Buffer
-	metaWriter := multipart.NewWriter(&metaBuf)
+	pr, pw := io.Pipe()
+	metaWriter := multipart.NewWriter(pw)
 
-	// Part 1: Metadata
-	h := make(textproto.MIMEHeader)
-	h.Set("Content-Type", "application/json; charset=UTF-8")
-	part1, _ := metaWriter.CreatePart(h)
-	meta := map[string]interface{}{
-		"name": filename,
-	}
-	if b.folderID != "" {
-		meta["parents"] = []string{b.folderID}
-	}
-	json.NewEncoder(part1).Encode(meta)
+	go func() {
+		defer pw.Close()
+		defer metaWriter.Close()
 
-	// Part 2: Content
-	h = make(textproto.MIMEHeader)
-	h.Set("Content-Type", "application/octet-stream")
-	part2, _ := metaWriter.CreatePart(h)
-	part2.Write(data)
-	metaWriter.Close()
+		// Part 1: Metadata
+		h := make(textproto.MIMEHeader)
+		h.Set("Content-Type", "application/json; charset=UTF-8")
+		part1, _ := metaWriter.CreatePart(h)
+		meta := map[string]interface{}{
+			"name": filename,
+		}
+		if b.folderID != "" {
+			meta["parents"] = []string{b.folderID}
+		}
+		json.NewEncoder(part1).Encode(meta)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", &metaBuf)
+		// Part 2: Content
+		h = make(textproto.MIMEHeader)
+		h.Set("Content-Type", "application/octet-stream")
+		part2, _ := metaWriter.CreatePart(h)
+		io.Copy(part2, data)
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", pr)
 	if err != nil {
 		return err
 	}
@@ -310,6 +314,11 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 	}
 
 	b.fileIdsMu.Lock()
+	// SAFETY: Prevent fileIDs map from infinite growth
+	if len(b.fileIDs) > 2000 {
+		b.fileIDs = make(map[string]string)
+	}
+
 	var names []string
 	for _, f := range resData.Files {
 		// Only collect exact prefix matches client-side just in case
@@ -323,7 +332,7 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 	return names, nil
 }
 
-func (b *GoogleBackend) Download(ctx context.Context, filename string) ([]byte, error) {
+func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadCloser, error) {
 	b.fileIdsMu.RLock()
 	fileID, ok := b.fileIDs[filename]
 	b.fileIdsMu.RUnlock()
@@ -347,14 +356,14 @@ func (b *GoogleBackend) Download(ctx context.Context, filename string) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		return nil, fmt.Errorf("download returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	return io.ReadAll(resp.Body)
+	return resp.Body, nil
 }
 
 func (b *GoogleBackend) Delete(ctx context.Context, filename string) error {

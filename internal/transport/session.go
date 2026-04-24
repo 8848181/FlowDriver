@@ -27,24 +27,43 @@ type Session struct {
 	TargetAddr   string
 	ClientID     string
 
+	// Backpressure: blocked when txBuf is too large
+	txCond *sync.Cond
+
 	// App channel for receiving data downloaded from remote
 	RxChan chan []byte
 }
 
 func NewSession(id string) *Session {
-	return &Session{
+	s := &Session{
 		ID:           id,
 		rxQueue:      make(map[uint64]*Envelope),
 		lastActivity: time.Now(),
 		RxChan:       make(chan []byte, 1024),
 	}
+	s.txCond = sync.NewCond(&s.mu)
+	return s
 }
 
 func (s *Session) EnqueueTx(data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// BACKPRESSURE: Block if txBuf is larger than 2MB
+	// This prevents memory explosion when uploading through the proxy
+	for len(s.txBuf) > 2*1024*1024 && !s.closed {
+		s.txCond.Wait()
+	}
+
 	s.txBuf = append(s.txBuf, data...)
 	s.lastActivity = time.Now()
+}
+
+func (s *Session) ClearTx() {
+	s.mu.Lock()
+	s.txBuf = nil
+	s.txCond.Broadcast() // Wake up any writers blocked on backpressure
+	s.mu.Unlock()
 }
 
 func (s *Session) ProcessRx(env *Envelope) {
